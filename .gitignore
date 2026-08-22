@@ -1,0 +1,4 @@
+/out/
+bazel-*
+*.pyc
+__pycache__/

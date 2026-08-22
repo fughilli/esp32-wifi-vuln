@@ -1,0 +1,179 @@
+"""HITL security-test firmware for validating esp32-reverse audit finding 001
+(MBSSID beacon-reconstruction heap overflow in the closed libnet80211).
+
+Authorized security testing on own hardware, isolated HITL bench. Two images run
+on two DUTs of one rig (hitl-rig-3): `mbssid_attacker` injects a crafted MBSSID
+beacon; `mbssid_target` scans and reports heap integrity so the overflow is
+observable over serial + JTAG. See esp32-reverse/tools/hitl/ for the driver.
+
+Same packaging pattern as //firmware/dut_id (cc_binary -> firmware_binary ->
+flash_bundle); tags=manual keeps these out of the //... wildcard.
+"""
+
+load("@embedded//rules:firmware.bzl", "firmware_binary")
+load("@embedded//rules:flash.bzl", "esptool_flash")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("//tools:flash_bundle.bzl", "flash_bundle")
+
+package(default_visibility = ["//visibility:public"])
+
+_C6 = select({
+    "@embedded//platforms:is_esp32c6": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+_WIFI_DEPS = [
+    "@embedded//libs/board:arduino_core",  # Arduino main() + esp-idf headers
+    "@embedded//libs/vendor:wifi",  # WiFi.h + esp_wifi
+]
+
+# ---- target: WiFi scanner; parses received beacons incl. MBSSID -------------
+cc_binary(
+    name = "mbssid_target",
+    srcs = ["mbssid_target.cpp"],
+    copts = ["-fno-rtti"],
+    target_compatible_with = _C6,
+    deps = _WIFI_DEPS,
+)
+
+firmware_binary(name = "target_esp32c6", binary = ":mbssid_target", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "target_flash", app = ":target_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "target_flashbundle", flash = ":target_flash", tags = ["manual"])
+
+# ---- attacker: crafted MBSSID beacon TX (malicious) ------------------------
+cc_binary(
+    name = "mbssid_attacker",
+    srcs = ["mbssid_attacker.cpp"],
+    copts = ["-fno-rtti"],
+    local_defines = ["LM_ATTACK=1"],
+    target_compatible_with = _C6,
+    deps = _WIFI_DEPS,
+)
+
+firmware_binary(name = "attacker_esp32c6", binary = ":mbssid_attacker", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "attacker_flash", app = ":attacker_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "attacker_flashbundle", flash = ":attacker_flash", tags = ["manual"])
+
+# ---- attacker (patched): overrides the 1500B esp_wifi_80211_tx sanity check -
+# Defines its own ieee80211_raw_frame_sanity_check()->0 so the blob's internal
+# call resolves to ours (link-time), lifting the 1500B raw-TX limit to reach the
+# target's 1700B RX buffer. --allow-multiple-definition in case the blob defines
+# that symbol in the same object as esp_wifi_80211_tx. Reaches ~1600B (tx ebuf).
+cc_binary(
+    name = "mbssid_attacker_patched",
+    srcs = ["mbssid_attacker.cpp"],
+    copts = ["-fno-rtti"],
+    local_defines = [
+        "LM_ATTACK=1",
+        "LM_PATCH_TXLIMIT=1",
+    ],
+    linkopts = ["-Wl,--allow-multiple-definition"],
+    target_compatible_with = _C6,
+    deps = _WIFI_DEPS,
+)
+
+firmware_binary(name = "attacker_patched_esp32c6", binary = ":mbssid_attacker_patched", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "attacker_patched_flash", app = ":attacker_patched_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "attacker_patched_flashbundle", flash = ":attacker_patched_flash", tags = ["manual"])
+
+# ---- attacker (benign baseline): spec-valid small MBSSID beacon ------------
+cc_binary(
+    name = "mbssid_attacker_benign",
+    srcs = ["mbssid_attacker.cpp"],
+    copts = ["-fno-rtti"],
+    local_defines = ["LM_ATTACK=0"],
+    target_compatible_with = _C6,
+    deps = _WIFI_DEPS,
+)
+
+firmware_binary(name = "attacker_benign_esp32c6", binary = ":mbssid_attacker_benign", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "attacker_benign_flash", app = ":attacker_benign_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "attacker_benign_flashbundle", flash = ":attacker_benign_flash", tags = ["manual"])
+
+# ---- the heapless stack, validated on-target --------------------------------
+# The FULL heapless WiFi+BLE+coex stack (rx/ieee80211/ble/gap/mlme/coex/tx/regs/
+# http/stack, mirror of esp32-reverse/stack/esp32c6-wifi) built as one static lib
+# and linked into tiny Arduino shims. Two harnesses:
+#   * conformance — runs the finding-001 corpus (the DEFENSE vs mbssid_target).
+#   * demos       — drives the three example roles through stack::Stack::ingest_*.
+# mac/phy/lmac (the real MMIO/PHY bring-up) are intentionally not vendored: these
+# harnesses exercise the allocation-free LOGIC, never the radio.
+rust_static_library(
+    name = "heapless_rs",
+    srcs = glob(["heapless_rs/src/*.rs"]),
+    crate_name = "heapless_rs",
+    crate_root = "heapless_rs/src/lib.rs",
+    edition = "2021",
+    target_compatible_with = _C6,
+)
+
+# A tiny Arduino app per harness, packaged per board. `_arduino` is arduino_core
+# (main() + Serial); each links the shared heapless static lib and calls one FFI.
+_arduino = _WIFI_DEPS[:1]
+
+# 1) finding-001 conformance (DEFENSE).
+cc_binary(
+    name = "heapless_conformance",
+    srcs = ["heapless_conformance.cpp"],
+    copts = ["-fno-rtti"],
+    target_compatible_with = _C6,
+    deps = _arduino + [":heapless_rs"],
+)
+
+firmware_binary(name = "heapless_conformance_esp32c6", binary = ":heapless_conformance", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "heapless_conformance_flash", app = ":heapless_conformance_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "heapless_conformance_flashbundle", flash = ":heapless_conformance_flash", tags = ["manual"])
+
+# 2) example roles. One macro-free block per role: cc_binary -> firmware -> bundle.
+cc_binary(
+    name = "ble_peripheral",
+    srcs = ["ble_peripheral.cpp"],
+    copts = ["-fno-rtti"],
+    target_compatible_with = _C6,
+    deps = _arduino + [":heapless_rs"],
+)
+
+firmware_binary(name = "ble_peripheral_esp32c6", binary = ":ble_peripheral", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "ble_peripheral_flash", app = ":ble_peripheral_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "ble_peripheral_flashbundle", flash = ":ble_peripheral_flash", tags = ["manual"])
+
+cc_binary(
+    name = "sta_client",
+    srcs = ["sta_client.cpp"],
+    copts = ["-fno-rtti"],
+    target_compatible_with = _C6,
+    deps = _arduino + [":heapless_rs"],
+)
+
+firmware_binary(name = "sta_client_esp32c6", binary = ":sta_client", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "sta_client_flash", app = ":sta_client_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "sta_client_flashbundle", flash = ":sta_client_flash", tags = ["manual"])
+
+cc_binary(
+    name = "ap_webserver",
+    srcs = ["ap_webserver.cpp"],
+    copts = ["-fno-rtti"],
+    target_compatible_with = _C6,
+    deps = _arduino + [":heapless_rs"],
+)
+
+firmware_binary(name = "ap_webserver_esp32c6", binary = ":ap_webserver", board = "esp32c6", opt_mode = "opt", tags = ["manual"])
+
+esptool_flash(name = "ap_webserver_flash", app = ":ap_webserver_esp32c6", tags = ["manual"])
+
+flash_bundle(name = "ap_webserver_flashbundle", flash = ":ap_webserver_flash", tags = ["manual"])
